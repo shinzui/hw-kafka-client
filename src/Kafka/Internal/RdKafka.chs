@@ -882,6 +882,28 @@ newRdKafkaT kafkaType confPtr =
 {#fun rd_kafka_set_log_level as ^
   {`RdKafkaTPtr', `Int'} -> `()' #}
 
+-- | Returns the error code and human readable description of the fatal error
+-- that was previously raised on this client, or 'RdKafkaRespErrNoError' (and an
+-- empty description) if no fatal error has been raised.
+--
+-- A fatal error permanently degrades the client and there is no recovery from
+-- it other than destroying the instance. For the high-level consumer,
+-- librdkafka additionally propagates the fact that a fatal error was raised as
+-- a consumer error carrying the generic code @RD_KAFKA_RESP_ERR__FATAL@; this
+-- call is how the /original/ cause behind that generic wrapper is recovered.
+--
+-- Cheap enough to call on every poll: when no fatal error has been raised the C
+-- implementation performs a single atomic read and returns, taking no locks and
+-- writing nothing to the buffer.
+rdKafkaFatalError :: RdKafkaTPtr -> IO (RdKafkaRespErrT, Text)
+rdKafkaFatalError k =
+    allocaBytes nErrorBytes $ \charPtr -> do
+        pokeByteOff charPtr 0 (0 :: CChar)
+        code <- withForeignPtr k $ \kPtr ->
+            {# call rd_kafka_fatal_error #} kPtr charPtr (fromIntegral nErrorBytes)
+        description <- peekCText charPtr
+        pure (cIntToEnum code, description)
+
 -- rd_kafka consume
 
 {#fun rd_kafka_consume_start as rdKafkaConsumeStartInternal

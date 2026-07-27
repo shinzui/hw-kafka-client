@@ -58,6 +58,7 @@ module Kafka.Consumer
 , committed, position, seek, seekPartitions
 , pollMessage, pollConsumerEvents
 , pollMessageBatch
+, consumerFatalError
 , commitOffsetMessage, commitAllOffsets, commitPartitionsOffsets
 , storeOffsets, storeOffsetMessage
 , rewindConsumer
@@ -70,7 +71,7 @@ where
 import           Control.Arrow              (left, (&&&))
 import           Control.Concurrent         (forkIO, modifyMVar, rtsSupportsBoundThreads, withMVar)
 import           Control.Exception          (bracket)
-import           Control.Monad              (forM_, void, when)
+import           Control.Monad              (forM_, unless, void, when)
 import           Control.Monad.IO.Class     (MonadIO (liftIO))
 import           Control.Monad.Trans.Except (ExceptT (ExceptT), runExceptT)
 import           Data.Bifunctor             (bimap, first)
@@ -80,11 +81,12 @@ import qualified Data.Map                   as M hiding (map, foldr)
 import           Data.Maybe                 (fromMaybe)
 import           Data.Set                   (Set)
 import qualified Data.Set                   as Set
+import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
 import           Foreign                    hiding (void)
 import           Kafka.Consumer.Convert     (fromMessagePtr, fromNativeTopicPartitionList'', offsetCommitToBool, offsetToInt64, toMap, toNativeTopicPartitionList, toNativeTopicPartitionList', topicPartitionFromMessageForCommit)
 import           Kafka.Consumer.Types       (KafkaConsumer (..))
-import           Kafka.Internal.RdKafka     (RdKafkaRespErrT (..), RdKafkaTopicPartitionListTPtr, RdKafkaTypeT (..), rdKafkaSeekPartitions, rdKafkaErrorDestroy, rdKafkaErrorCode, newRdKafkaT, newRdKafkaTopicPartitionListT, newRdKafkaTopicT, rdKafkaAssign, rdKafkaAssignment, rdKafkaCommit, rdKafkaCommitted, rdKafkaConfSetDefaultTopicConf, rdKafkaConsumeBatchQueue, rdKafkaConsumeQueue, rdKafkaConsumerClose, rdKafkaConsumerPoll, rdKafkaOffsetsStore, rdKafkaPausePartitions, rdKafkaPollSetConsumer, rdKafkaPosition, rdKafkaQueueDestroy, rdKafkaQueueNew, rdKafkaResumePartitions, rdKafkaSeek, rdKafkaSetLogLevel, rdKafkaSubscribe, rdKafkaSubscription, rdKafkaTopicConfDup, rdKafkaTopicPartitionListAdd)
+import           Kafka.Internal.RdKafka     (RdKafkaRespErrT (..), RdKafkaTopicPartitionListTPtr, RdKafkaTypeT (..), rdKafkaSeekPartitions, rdKafkaErrorDestroy, rdKafkaErrorCode, newRdKafkaT, newRdKafkaTopicPartitionListT, newRdKafkaTopicT, rdKafkaAssign, rdKafkaAssignment, rdKafkaCommit, rdKafkaCommitted, rdKafkaConfSetDefaultTopicConf, rdKafkaConsumeBatchQueue, rdKafkaConsumeQueue, rdKafkaConsumerClose, rdKafkaConsumerPoll, rdKafkaFatalError, rdKafkaMessageDestroy, rdKafkaOffsetsStore, rdKafkaPausePartitions, rdKafkaPollSetConsumer, rdKafkaPosition, rdKafkaQueueDestroy, rdKafkaQueueNew, rdKafkaResumePartitions, rdKafkaSeek, rdKafkaSetLogLevel, rdKafkaSubscribe, rdKafkaSubscription, rdKafkaTopicConfDup, rdKafkaTopicPartitionListAdd)
 import           Kafka.Internal.Setup       (CallbackPollStatus (..), Kafka (..), KafkaConf (..), KafkaProps (..), TopicConf (..), TopicProps (..), getKafkaConf, getRdKafka, kafkaConf, topicConf, Callback(..))
 import           Kafka.Internal.Shared      (kafkaErrorToMaybe, maybeToLeft, rdKafkaErrorToEither)
 
@@ -165,32 +167,87 @@ newConsumer props (Subscription ts tp) = liftIO $ do
               return (Left err)
 
 -- | Polls a single message
+--
+-- If a /fatal/ error has been raised on this client, this returns
+-- @Left ('KafkaResponseError' 'RdKafkaRespErrFatal')@ immediately, without
+-- polling, and keeps doing so on every subsequent call. A fatal error is
+-- permanent — librdkafka halts all consumer group activity for the client and
+-- the only remedy is to close the consumer — so it is reported until the
+-- consumer is closed rather than delivered once and forgotten.
+--
+-- This matters most in 'CallbackPollModeAsync'. There the application drains a
+-- side queue, while consumer errors — including the fatal one — are delivered
+-- only on librdkafka's consumer queue, which the background callback-poll loop
+-- drains. Before this check existed, a fatal error was therefore unobservable
+-- in async mode: the application simply polled an empty side queue forever. It
+-- could not be observed through @error_cb@ either, because librdkafka returns
+-- consumer errors to the application as messages and never routes them to the
+-- error callback.
+--
+-- Use 'consumerFatalError' to recover the underlying cause of the fatal error
+-- and its human readable description.
 pollMessage :: MonadIO m
             => KafkaConsumer
             -> Timeout -- ^ the timeout, in milliseconds
             -> m (Either KafkaError (ConsumerRecord (Maybe BS.ByteString) (Maybe BS.ByteString))) -- ^ Left on error or timeout, right for success
-pollMessage c@(KafkaConsumer _ (KafkaConf _ qr _)) (Timeout ms) = liftIO $ do
-  mbq <- readIORef qr
-  case mbq of
-    Nothing -> rdKafkaConsumerPoll (getRdKafka c) ms >>= fromMessagePtr
-    Just q  -> rdKafkaConsumeQueue q (fromIntegral ms) >>= fromMessagePtr
+pollMessage c@(KafkaConsumer _ (KafkaConf _ qr _)) (Timeout ms) = liftIO $
+  pollFatalError c >>= \case
+    Just err -> pure (Left err)
+    Nothing  -> do
+      mbq <- readIORef qr
+      case mbq of
+        Nothing -> rdKafkaConsumerPoll (getRdKafka c) ms >>= fromMessagePtr
+        Just q  -> rdKafkaConsumeQueue q (fromIntegral ms) >>= fromMessagePtr
 
 -- | Polls up to 'BatchSize' messages.
 -- Unlike 'pollMessage' this function does not return usual "timeout" errors.
 -- An empty batch is returned when there are no messages available.
 --
 -- This API is not available when 'CallbackPollMode' is set to 'CallbackPollModeSync'.
+--
+-- As with 'pollMessage', if a fatal error has been raised on this client this
+-- returns a single-element batch
+-- @['Left' ('KafkaResponseError' 'RdKafkaRespErrFatal')]@ immediately and keeps
+-- doing so on every subsequent call. Note that this is the one error this
+-- function does return: an ordinary empty batch still means "no messages
+-- available", but a fatal error means the consumer is permanently dead.
 pollMessageBatch :: MonadIO m
                  => KafkaConsumer
                  -> Timeout
                  -> BatchSize
                  -> m [Either KafkaError (ConsumerRecord (Maybe BS.ByteString) (Maybe BS.ByteString))]
-pollMessageBatch c@(KafkaConsumer _ (KafkaConf _ qr _)) (Timeout ms) (BatchSize b) = liftIO $ do
-  pollConsumerEvents c Nothing
-  mbq <- readIORef qr
-  case mbq of
-    Nothing -> return [Left $ KafkaBadSpecification "Calling pollMessageBatch while CallbackPollMode is set to CallbackPollModeSync."]
-    Just q  -> whileNoCallbackRunning c $ rdKafkaConsumeBatchQueue q ms b >>= traverse fromMessagePtr
+pollMessageBatch c@(KafkaConsumer _ (KafkaConf _ qr _)) (Timeout ms) (BatchSize b) = liftIO $
+  pollFatalError c >>= \case
+    Just err -> pure [Left err]
+    Nothing  -> do
+      pollConsumerEvents c Nothing
+      mbq <- readIORef qr
+      case mbq of
+        Nothing -> return [Left $ KafkaBadSpecification "Calling pollMessageBatch while CallbackPollMode is set to CallbackPollModeSync."]
+        Just q  -> whileNoCallbackRunning c $ rdKafkaConsumeBatchQueue q ms b >>= traverse fromMessagePtr
+
+-- | Returns the underlying cause of the fatal error raised on this client,
+-- together with librdkafka's human readable description of it, or 'Nothing'
+-- when no fatal error has been raised.
+--
+-- Fatal errors are permanent. They are raised for conditions from which the
+-- client cannot recover — the canonical consumer example is a /fenced/ static
+-- group member, where a second consumer joined with the same
+-- @group.instance.id@ and the broker fenced this one. Once a fatal error is
+-- raised librdkafka halts all consumer group activity: rejoins return
+-- immediately and subscribes are treated as unsubscribes. The only remedy is to
+-- close this consumer and create a new one.
+--
+-- 'pollMessage' and 'pollMessageBatch' report the /generic/ code
+-- 'RdKafkaRespErrFatal' in-band, identically in both callback poll modes; this
+-- function is how the specific cause — for example
+-- @RdKafkaRespErrFencedInstanceId@ — is recovered for logging or alerting.
+consumerFatalError :: MonadIO m => KafkaConsumer -> m (Maybe (KafkaError, Text))
+consumerFatalError c = liftIO $ do
+  (cause, description) <- rdKafkaFatalError (getRdKafka c)
+  pure $ case cause of
+    RdKafkaRespErrNoError -> Nothing
+    _                     -> Just (KafkaResponseError cause, description)
 
 -- | Commit message's offset on broker for the message's partition.
 commitOffsetMessage :: MonadIO m
@@ -336,6 +393,11 @@ position (KafkaConsumer (Kafka k) _) tps = liftIO $ do
 -- unless some special cases in a single-threaded environment
 -- when polling for events on each 'pollMessage' is not
 -- frequent enough.
+--
+-- Any message librdkafka returns from this poll (a fetched record that raced a
+-- partition-queue redirect, or a consumer error) is discarded and destroyed.
+-- Fatal errors remain observable through 'pollMessage', 'pollMessageBatch' and
+-- 'consumerFatalError', which read librdkafka's fatal state directly.
 pollConsumerEvents :: KafkaConsumer -> Maybe Timeout -> IO ()
 pollConsumerEvents k timeout =
   void . withCallbackPollEnabled k $ pollConsumerEvents' k timeout
@@ -451,7 +513,43 @@ withCallbackPollEnabled k f = do
    CallbackPollEnabled  -> f >> pure CallbackPollEnabled
    CallbackPollDisabled -> pure CallbackPollDisabled
 
+-- | Polls the consumer queue to let librdkafka serve callback-type events, and
+-- destroys whatever message that poll hands back.
+--
+-- Most events on the consumer queue are served as callbacks inside librdkafka
+-- during the poll itself and nothing is returned. Two kinds of event are
+-- instead /returned/ to the caller as a message: a fetched record that raced a
+-- partition-queue redirect, and any consumer error. This function is only
+-- interested in the callback side effects, so it discards both — but it must
+-- still free them. The returned foreign pointer carries no finalizer, so
+-- dropping it without calling 'rdKafkaMessageDestroy' leaks the underlying C
+-- message; before this was fixed, every consumer error and every raced record
+-- leaked, on a loop that runs every 100 ms.
+--
+-- Discarding a returned consumer error costs no observability: fatal errors are
+-- reported in-band by 'pollMessage' and 'pollMessageBatch', which read
+-- librdkafka's fatal state directly rather than relying on this loop having
+-- seen the message, and non-fatal consumer errors were never visible from here
+-- to begin with (librdkafka does not route them to @error_cb@).
 pollConsumerEvents' :: KafkaConsumer -> Maybe Timeout -> IO ()
-pollConsumerEvents' k timeout =
+pollConsumerEvents' k timeout = do
   let (Timeout tm) = fromMaybe (Timeout 0) timeout
-  in void $ rdKafkaConsumerPoll (getRdKafka k) tm
+  msgPtr <- rdKafkaConsumerPoll (getRdKafka k) tm
+  withForeignPtr msgPtr $ \realPtr ->
+    unless (realPtr == nullPtr) (rdKafkaMessageDestroy realPtr)
+
+-- | The in-band error a poll must report because a fatal error has been raised
+-- on this client, or 'Nothing' when the client is healthy.
+--
+-- Reports the generic 'RdKafkaRespErrFatal' rather than the underlying cause so
+-- that both callback poll modes deliver an identical value: in
+-- 'CallbackPollModeSync' librdkafka itself hands exactly this code to the
+-- application as a consumer error, and callers should not have to discriminate
+-- by poll mode when classifying an error as fatal. 'consumerFatalError' recovers
+-- the cause when it is wanted.
+pollFatalError :: KafkaConsumer -> IO (Maybe KafkaError)
+pollFatalError c = do
+  (cause, _description) <- rdKafkaFatalError (getRdKafka c)
+  pure $ case cause of
+    RdKafkaRespErrNoError -> Nothing
+    _                     -> Just (KafkaResponseError RdKafkaRespErrFatal)

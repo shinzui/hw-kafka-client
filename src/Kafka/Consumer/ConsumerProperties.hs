@@ -46,6 +46,15 @@ data CallbackPollMode =
     -- happens, at the cost of manually managing those events.
     CallbackPollModeSync
     -- | Handle polling rebalance and keep alive events for you in a background thread.
+    --
+    -- Note that @max.poll.interval.ms@ cannot detect a stuck application in
+    -- this mode. The background thread polls librdkafka's consumer queue every
+    -- 100 ms, and librdkafka counts /any/ poll of that queue as application
+    -- progress and resets the @max.poll.interval.ms@ timer — regardless of
+    -- whether the application is calling 'Kafka.Consumer.pollMessage' at all.
+    -- An application that relies on the broker evicting it when it stops making
+    -- progress must use 'CallbackPollModeSync', where the application's own
+    -- polls are the only ones that happen.
   | CallbackPollModeAsync deriving (Show, Eq)
 
 -- | Properties to create 'Kafka.Consumer.Types.KafkaConsumer'.
